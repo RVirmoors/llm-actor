@@ -58,8 +58,13 @@ from services.stt import build_deepgram_flux_stt
 from services.tts import build_deepgram_tts
 from services.tts_kokoro import KokoroTTSService
 from services.stt_moonshine import MoonshineSTTService
+from services.vision_gemini import describe_image
+from services.camera import capture_image
 
 import keyboard
+import asyncio
+
+
 
 UserCallback = Callable[[str], Awaitable[None]]
 LLM_TEXT_IS_TEXTFRAME = issubclass(LLMTextFrame, TextFrame)
@@ -73,6 +78,21 @@ class AssistantAggregator(OpenAIAssistantContextAggregator):
         super().__init__(*args, **kwargs)
         self._on_message = on_message
         self._on_partial = on_partial
+
+    async def handle_aggregation(self, aggregation):
+        await super().handle_aggregation(aggregation)
+        clean_text = aggregation.strip()
+        if clean_text and self._on_message:
+            result = self._on_message(clean_text)
+            if inspect.isawaitable(result):
+                await result
+
+class UserAggregator(OpenAIUserContextAggregator):
+    def __init__(self, *args,
+                 on_message: Optional[UserCallback] = None,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_message = on_message
 
     async def handle_aggregation(self, aggregation):
         await super().handle_aggregation(aggregation)
@@ -225,6 +245,36 @@ class VoiceSwitcher(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
+class VisionInjector(FrameProcessor):
+    def __init__(self, capture_fn, describe_fn, **kwargs):
+        super().__init__(**kwargs)
+        self._capture_fn = capture_fn
+        self._describe_fn = describe_fn
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            try:
+                base64_img = self._capture_fn()
+                # scene_description = self._describe_fn(base64_img)
+                loop = asyncio.get_running_loop()
+                scene_description = await loop.run_in_executor(
+                    None,
+                    lambda: describe_image(capture_image())
+                )
+
+                # THIS is what the LLM will actually see
+                frame.text = f"{frame.text}\n\n[Visual context: {scene_description}]"
+
+                print("📸 Injected vision:", scene_description)
+
+            except Exception as e:
+                print("Vision error:", e)
+
+        await self.push_frame(frame, direction)
+
+    
 @dataclass
 class PipelineComponents:
     pipeline: Pipeline
@@ -267,6 +317,7 @@ class VoicePipelineController:
         self._voice_switcher: Optional[VoiceSwitcher] = None
         self._context_aggregator: Optional[OpenAIContextAggregatorPair] = None
         self._assistant_aggregator: Optional[AssistantAggregator] = None
+        self._user_aggregator: Optional[UserAggregator] = None
 
         self._previous_speaker = "persona2"
         self._current_speaker = "persona1"
@@ -347,6 +398,11 @@ class VoicePipelineController:
             on_message=self._on_assistant_message,
             on_partial=self._on_assistant_partial,
         )
+        self._user_aggregator = UserAggregator(
+            context,
+            on_message=self._on_user_message,
+        )
+
 
         if config.audio.aec == "off":
             # replace AEC with no-op
@@ -378,8 +434,9 @@ class VoicePipelineController:
             self._transport.input(),
             self._aec_proc,
             self._stt_service,
+            VisionInjector(capture_image, describe_image),
             STTStandaloneIFilter(event_logger=self._event_logger),
-            self._context_aggregator.user(),
+            self._user_aggregator,
             self._llm_service,
             ActionExtractorFilter(self._actions_path, self._event_logger),
             self._tts_service,
@@ -689,3 +746,4 @@ async def run_voice_pipeline(session_name: Optional[str] = None) -> None:
     )
 
     await controller.start()
+
