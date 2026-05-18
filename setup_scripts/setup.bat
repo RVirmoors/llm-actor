@@ -6,8 +6,6 @@ set REPO_URL=https://github.com/RVirmoors/llm-actor
 set REPO_ZIP=https://github.com/RVirmoors/llm-actor/archive/refs/heads/main.zip
 set TARGET_DIR=llm-actor
 set "ASSET_DIR=llm-actor\assets"
-set PYTHON_INSTALLER_URL=https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe
-set PYTHON_INSTALLER=python-3.11.9-amd64.exe
 
 REM === CHECK FOR MSVC++ REDISTRIBUTABLE (x64) ===
 set "NEED_VCREDIST="
@@ -36,42 +34,48 @@ if defined NEED_VCREDIST (
 )
 
 
+set PYTHON_INSTALLER_URL=https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe
+set PYTHON_INSTALLER=python-3.11.9-amd64.exe
 
-REM === CHECK FOR PYTHON 3.10+ ===
-echo Checking for Python...
-setlocal enabledelayedexpansion
+echo Checking for compatible Python (3.10 or 3.11)...
+setlocal EnableExtensions EnableDelayedExpansion
 
-python --version >nul 2>&1
-if errorlevel 1 (
-    set NEED_PYTHON_INSTALL=1
-) else (
-    REM Extract version string safely
-    for /f "tokens=2 delims= " %%v in ('python --version') do set PY_VER=%%v
+set PYTHON_EXE=
 
-    REM Split Major.Minor.Patch
-    for /f "tokens=1,2,3 delims=." %%a in ("!PY_VER!") do (
-        set PY_MAJOR=%%a
-        set PY_MINOR=%%b
+REM === Try Python launcher (preferred method) ===
+py -0p >nul 2>&1
+if not errorlevel 1 (
+for /f "tokens=1,*" %%a in ('py -0p 2^>nul') do (
+    echo %%a | findstr /C:"-V:3.11" >nul
+    if not errorlevel 1 set "PYTHON_EXE=%%b"
+
+    if not defined PYTHON_EXE (
+        echo %%a | findstr /C:"-V:3.10" >nul
+        if not errorlevel 1 set "PYTHON_EXE=%%b"
     )
+)
+)
 
-    REM Ensure values exist before comparing
-    if not defined PY_MAJOR set NEED_PYTHON_INSTALL=1
-    if not defined PY_MINOR set NEED_PYTHON_INSTALL=1
+REM === Fallback: check default python in PATH ===
+if not defined PYTHON_EXE (
+    python --version >nul 2>&1
+    if not errorlevel 1 (
+        for /f "tokens=2 delims= " %%v in ('python --version') do set PY_VER=%%v
 
-    REM Compare version numbers
-    if not defined NEED_PYTHON_INSTALL (
-        if !PY_MAJOR! LSS 3 (
-            set NEED_PYTHON_INSTALL=1
-        ) else if !PY_MAJOR!==3 if !PY_MINOR! LSS 10 (
-            set NEED_PYTHON_INSTALL=1
+        for /f "tokens=1,2 delims=." %%a in ("!PY_VER!") do (
+            set PY_MAJOR=%%a
+            set PY_MINOR=%%b
         )
+
+        if "!PY_MAJOR!"=="3" if "!PY_MINOR!"=="11" set PYTHON_EXE=python
+        if "!PY_MAJOR!"=="3" if "!PY_MINOR!"=="10" set PYTHON_EXE=python
     )
 )
 
-
-if defined NEED_PYTHON_INSTALL (
+REM === Install Python if nothing usable found ===
+if not defined PYTHON_EXE (
     echo.
-    echo Python 3.10+ is required. Installing Python 3.11.9...
+    echo No compatible Python found. Installing Python 3.11.9...
 
     powershell -Command ^
         "Invoke-WebRequest -Uri '%PYTHON_INSTALLER_URL%' -OutFile '%PYTHON_INSTALLER%'"
@@ -82,32 +86,50 @@ if defined NEED_PYTHON_INSTALL (
         exit /b 1
     )
 
-    start "" "%PYTHON_INSTALLER%"
+start "" /wait "%PYTHON_INSTALLER%" /quiet ^
+    InstallAllUsers=0 ^
+    PrependPath=1 ^
+    Include_launcher=1 ^
+    AssociateFiles=0 ^
+    Shortcuts=0 ^
+    Include_pip=1
+    
+echo Waiting for system to register Python...
 
-    echo.
-    echo ================= IMPORTANT =================
-    echo Enable the option:
-    echo.
-    echo      [x] Add python.exe to PATH
-    echo.
-    echo The installer will not work without this.
-    echo =============================================
-    echo.
-    pause
+REM Give Windows time to register PATH / launcher
+timeout /t 5 /nobreak >nul
 
-    echo Rechecking Python availability...
-    python --version >nul 2>&1
+REM Force refresh environment variables for current session
+for /f "tokens=2*" %%A in ('reg query "HKCU\Environment" /v PATH 2^>nul') do set "USER_PATH=%%B"
+set "PATH=%PATH%;%USER_PATH%"
+
+REM Re-check Python
+    py -0p >nul 2>&1
     if errorlevel 1 (
-        echo Python is still not detected in PATH. 
-        echo You probably simply need to run setup.bat again.
-        echo Please make sure you enabled "Add python.exe to PATH".
+        echo Python launcher not available yet.
+        echo Please run this script again and it should work.
+        pause
+        exit /b 1
+    )
+
+    for /f "tokens=1,2,*" %%a in ('py -0p 2^>nul') do (
+        echo %%a %%b %%c | findstr /C:"-V:3.11" >nul
+        if not errorlevel 1 set PYTHON_EXE=%%c
+    )
+
+    if not defined PYTHON_EXE (
+        echo Python 3.11 installation not detected yet.
+        echo Please run this script again and it should work.
         pause
         exit /b 1
     )
 )
 
-echo Python detected.
 echo.
+echo Using Python: %PYTHON_EXE%
+echo.
+
+endlocal & set PYTHON_EXE=%PYTHON_EXE%
 
 
 
@@ -153,37 +175,44 @@ REM === DOWNLOAD KOKORO MODEL FILES ===
 
 if not exist "%ASSET_DIR%" mkdir "%ASSET_DIR%"
 
-echo This project uses Kokoro for local text-to-speech.
-echo You can choose between Kokoro (default) or Deepgram TTS in settings.ini later.
-echo.
-echo Downloading kokoro-v1.0.onnx...
-powershell -Command ^
-  "Invoke-WebRequest -Uri 'https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx' -OutFile '%ASSET_DIR%\kokoro-v1.0.onnx'"
+if exist "%ASSET_DIR%\kokoro-v1.0.onnx" (
+    echo Kokoro ONNX model already exists, skipping download.
+) else (
+    echo This project uses Kokoro for local text-to-speech.
+    echo You can choose between Kokoro or Deepgram TTS in settings.ini later.
+    echo.
+    echo Downloading kokoro-v1.0.onnx...
+    powershell -Command ^
+      "Invoke-WebRequest -Uri 'https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx' -OutFile '%ASSET_DIR%\kokoro-v1.0.onnx'"
 
-if not exist "%ASSET_DIR%\kokoro-v1.0.onnx" (
-    echo Failed to download kokoro-v1.0.onnx
-    pause
-    exit /b 1
+    if not exist "%ASSET_DIR%\kokoro-v1.0.onnx" (
+        echo Failed to download kokoro-v1.0.onnx
+        pause
+        exit /b 1
+    )
 )
+if exist "%ASSET_DIR%\voices-v1.0.bin" (
+    echo Kokoro voices file already exists, skipping download.
+) else (
+    echo Downloading voices-v1.0.bin...
+    powershell -Command ^
+      "Invoke-WebRequest -Uri 'https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin' -OutFile '%ASSET_DIR%\voices-v1.0.bin'"
 
-echo Downloading voices-v1.0.bin...
-powershell -Command ^
-  "Invoke-WebRequest -Uri 'https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin' -OutFile '%ASSET_DIR%\voices-v1.0.bin'"
+    if not exist "%ASSET_DIR%\voices-v1.0.bin" (
+        echo Failed to download voices-v1.0.bin
+        pause
+        exit /b 1
+    )
 
-if not exist "%ASSET_DIR%\voices-v1.0.bin" (
-    echo Failed to download voices-v1.0.bin
-    pause
-    exit /b 1
+    echo Kokoro model files downloaded successfully.
+    echo.
 )
-
-echo Kokoro model files downloaded successfully.
-echo.
 
 echo Setting up the project Python environment...
 cd "%TARGET_DIR%"
 
 REM === PYTHON ENV SETUP ===
-python -m venv venv
+"%PYTHON_EXE%" -m venv venv
 call venv\Scripts\activate
 python -m pip install --upgrade pip
 pip install .
